@@ -1,101 +1,77 @@
-// Request.swift
-//
-// The MIT License (MIT)
-//
-// Copyright (c) 2015 Zewo
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-
 extension Request {
-    public typealias DidUpgrade = (Response, Stream) throws -> Void
+    public init(method: Method = .get, uri: URI = URI(path: "/"), headers: Headers = [:], body: Data = []) {
+        self.init(
+            method: method,
+            uri: uri,
+            version: Version(major: 1, minor: 1),
+            headers: headers,
+            body: .buffer(body)
+        )
 
-    public var didUpgrade: DidUpgrade? {
-        get {
-            return storage["request-connection-upgrade"] as? DidUpgrade
-        }
+        self.headers["Content-Length"] = body.count.description
+    }
 
-        set(didUpgrade) {
-            storage["request-connection-upgrade"] = didUpgrade
-        }
+    public init(method: Method = .get, uri: URI = URI(path: "/"), headers: Headers = [:], body: ReceivingStream) {
+        self.init(
+            method: method,
+            uri: uri,
+            version: Version(major: 1, minor: 1),
+            headers: headers,
+            body: .receiver(body)
+        )
+
+        self.headers["Transfer-Encoding"] = "chunked"
+    }
+
+    public init(method: Method = .get, uri: URI = URI(path: "/"), headers: Headers = [:], body: @escaping (C7.SendingStream) throws -> Void) {
+        self.init(
+            method: method,
+            uri: uri,
+            version: Version(major: 1, minor: 1),
+            headers: headers,
+            body: .sender(body)
+        )
+
+        self.headers["Transfer-Encoding"] = "chunked"
     }
 }
 
 extension Request {
-    public init(method: Method = .get, uri: URI = URI(path: "/"), headers: Headers = [:], body: Stream, didUpgrade: DidUpgrade?) {
+    public init(method: Method = .get, uri: URI = URI(path: "/"), headers: Headers = [:], body: DataRepresentable) {
         self.init(
             method: method,
             uri: uri,
             headers: headers,
-            body: body
-        )
-
-        self.didUpgrade = didUpgrade
-    }
-
-    public init(method: Method = .get, uri: URI = URI(path: "/"), headers: Headers = [:], body: Data = Data(), didUpgrade: DidUpgrade?) {
-        self.init(
-            method: method,
-            uri: uri,
-            headers: headers,
-            body: body
-        )
-
-        self.didUpgrade = didUpgrade
-    }
-
-    public init(method: Method = .get, uri: URI = URI(path: "/"), headers: Headers = [:], body: DataConvertible, didUpgrade: DidUpgrade? = nil) {
-        self.init(
-            method: method,
-            uri: uri,
-            headers: headers,
-            body: body.data,
-            didUpgrade: didUpgrade
+            body: body.data
         )
     }
+}
 
-    public init(method: Method = .get, uri: String, headers: Headers = [:], body: Data = Data(), didUpgrade: DidUpgrade? = nil) throws {
+extension Request {
+    public init(method: Method = .get, uri: String, headers: Headers = [:], body: Data = []) throws {
         self.init(
             method: method,
             uri: try URI(uri),
             headers: headers,
-            body: body,
-            didUpgrade: didUpgrade
+            body: body
         )
     }
 
-    public init(method: Method = .get, uri: String, headers: Headers = [:], body: DataConvertible, didUpgrade: DidUpgrade? = nil) throws {
-        try self.init(
-            method: method,
-            uri: uri,
-            headers: headers,
-            body: body.data,
-            didUpgrade: didUpgrade
-        )
-    }
-
-    public init(method: Method = .get, uri: String, headers: Headers = [:], body: Stream, didUpgrade: DidUpgrade? = nil) throws {
+    public init(method: Method = .get, uri: String, headers: Headers = [:], body: ReceivingStream) throws {
         self.init(
             method: method,
             uri: try URI(uri),
             headers: headers,
-            body: body,
-            didUpgrade: didUpgrade
+            body: body
+        )
+    }
+
+    public init(method: Method = .get, uri: String, headers: Headers = [:], body: @escaping (C7.SendingStream) throws -> Void) throws {
+        self.init(
+            method: method,
+            uri: try URI(uri),
+            headers: headers,
+            body: body
         )
     }
 }
@@ -105,8 +81,8 @@ extension Request {
         return uri.path
     }
 
-    public var query: [String: [String?]] {
-        return uri.query
+    public var query: [String: String] {
+        return uri.singleValuedQuery
     }
 }
 
@@ -138,17 +114,15 @@ extension Request {
         }
     }
 
-    // Waiting on removal of cookies at S4
+    public var cookies: Set<Cookie> {
+        get {
+            return headers["Cookie"].flatMap({Set<Cookie>(cookieHeader: $0)}) ?? []
+        }
 
-    // public var cookies: Set<Cookie> {
-    //     get {
-    //         return headers["Cookie"].merged().flatMap(Cookie.parse) ?? []
-    //     }
-
-    //     set(cookies) {
-    //         headers["Cookie"] = Header(merging: cookies.map({$0.description}))
-    //     }
-    // }
+        set(cookies) {
+            headers["Cookie"] = cookies.map({$0.description}).joined(separator: ", ")
+        }
+    }
 
     public var host: String? {
         get {
@@ -182,6 +156,18 @@ extension Request {
 }
 
 extension Request {
+    public typealias UpgradeConnection = (Response, Stream) throws -> Void
+
+    public var upgradeConnection: UpgradeConnection? {
+        return storage["request-connection-upgrade"] as? UpgradeConnection
+    }
+
+    public mutating func upgradeConnection(_ upgrade: UpgradeConnection)  {
+        storage["request-connection-upgrade"] = upgrade
+    }
+}
+
+extension Request {
     public var pathParameters: [String: String] {
         get {
             return storage["pathParameters"] as? [String: String] ?? [:]
@@ -193,9 +179,9 @@ extension Request {
     }
 }
 
-extension Request: CustomStringConvertible {
+extension Request : CustomStringConvertible {
     public var requestLineDescription: String {
-        return "\(method) \(uri) HTTP/\(version.major).\(version.minor)\n"
+        return String(describing: method) + " " + String(describing: uri) + " HTTP/" + String(describing: version.major) + "." + String(describing: version.minor) + "\n"
     }
 
     public var description: String {
@@ -204,8 +190,8 @@ extension Request: CustomStringConvertible {
     }
 }
 
-extension Request: CustomDebugStringConvertible {
+extension Request : CustomDebugStringConvertible {
     public var debugDescription: String {
-        return description + "\n\n" + storageDescription
+        return description + "\n" + storageDescription
     }
 }

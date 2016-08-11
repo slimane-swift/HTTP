@@ -1,68 +1,47 @@
-// Response.swift
-//
-// The MIT License (MIT)
-//
-// Copyright (c) 2015 Zewo
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-
 extension Response {
-    public typealias DidUpgrade = (Request, Stream) throws -> Void
+    public init(status: Status = .ok, headers: Headers = [:], body: Data = []) {
+        self.init(
+            version: Version(major: 1, minor: 1),
+            status: status,
+            headers: headers,
+            cookieHeaders: [],
+            body: .buffer(body)
+        )
 
-    public var didUpgrade: DidUpgrade? {
-        get {
-            return storage["response-connection-upgrade"] as? DidUpgrade
-        }
+        self.headers["Content-Length"] = body.count.description
+    }
 
-        set(didUpgrade) {
-            storage["response-connection-upgrade"] = didUpgrade
-        }
+    public init(status: Status = .ok, headers: Headers = [:], body: ReceivingStream) {
+        self.init(
+            version: Version(major: 1, minor: 1),
+            status: status,
+            headers: headers,
+            cookieHeaders: [],
+            body: .receiver(body)
+        )
+
+        self.headers["Transfer-Encoding"] = "chunked"
+    }
+
+    public init(status: Status = .ok, headers: Headers = [:], body: @escaping (C7.SendingStream) throws -> Void) {
+        self.init(
+            version: Version(major: 1, minor: 1),
+            status: status,
+            headers: headers,
+            cookieHeaders: [],
+            body: .sender(body)
+        )
+
+        self.headers["Transfer-Encoding"] = "chunked"
     }
 }
 
 extension Response {
-    public init(status: Status = .ok, headers: Headers = [:], body: Stream, didUpgrade: DidUpgrade?) {
+    public init(status: Status = .ok, headers: Headers = [:], body: DataConvertible) {
         self.init(
             status: status,
             headers: headers,
-            body: body
-        )
-
-        self.didUpgrade = didUpgrade
-    }
-
-    public init(status: Status = .ok, headers: Headers = [:], body: Data = Data(), didUpgrade: DidUpgrade?) {
-        self.init(
-            status: status,
-            headers: headers,
-            body: body
-        )
-
-        self.didUpgrade = didUpgrade
-    }
-
-    public init(status: Status = .ok, headers: Headers = [:], body: DataConvertible, didUpgrade: DidUpgrade? = nil) {
-        self.init(
-            status: status,
-            headers: headers,
-            body: body.data,
-            didUpgrade: didUpgrade
+            body: body.data
         )
     }
 }
@@ -77,9 +56,48 @@ extension Response {
     }
 }
 
-extension Response: CustomStringConvertible {
+extension Response {
+    public var cookies: Set<AttributedCookie> {
+        get {
+            var cookies = Set<AttributedCookie>()
+
+            for header in cookieHeaders {
+                if let cookie = AttributedCookie(header) {
+                    cookies.insert(cookie)
+                }
+            }
+
+            return cookies
+        }
+
+        set(cookies) {
+            var headers = Set<String>()
+
+            for cookie in cookies {
+                let header = String(describing: cookie)
+                headers.insert(header)
+            }
+
+            cookieHeaders = headers
+        }
+    }
+}
+
+extension Response {
+    public typealias UpgradeConnection = (Request, Stream) throws -> Void
+
+    public var upgradeConnection: UpgradeConnection? {
+        return storage["response-connection-upgrade"] as? UpgradeConnection
+    }
+
+    public mutating func upgradeConnection(_ upgrade: UpgradeConnection)  {
+        storage["response-connection-upgrade"] = upgrade
+    }
+}
+
+extension Response : CustomStringConvertible {
     public var statusLineDescription: String {
-        return "HTTP/1.1 " + statusCode.description + " " + reasonPhrase + "\n"
+        return "HTTP/" + String(version.major) + "." + String(version.minor) + " " + String(statusCode) + " " + reasonPhrase + "\n"
     }
 
     public var description: String {
@@ -88,8 +106,117 @@ extension Response: CustomStringConvertible {
     }
 }
 
-extension Response: CustomDebugStringConvertible {
+extension Response : CustomDebugStringConvertible {
     public var debugDescription: String {
-        return description + "\n\n" + storageDescription
+        return description + "\n" + storageDescription
+    }
+}
+
+
+extension Body {
+    /**
+     Converts the body's contents into a `Data` buffer asynchronously.
+     If the body is a receiver, sender, asyncReceiver or asyncSender type,
+     it will be drained.
+     */
+    public func asyncBecomeBuffer(timingOut deadline: Double = .never, completion: @escaping ((Void) throws -> (Body, Data)) -> Void) {
+        switch self {
+        case .asyncReceiver(let stream):
+            _ = AsyncDrain(for: stream, timingOut: deadline) { closure in
+                completion {
+                    let drain = try closure ()
+                    return (.buffer(drain.data), drain.data)
+                }
+            }
+            
+        case .asyncSender(let sender):
+            let drain = AsyncDrain()
+            sender(drain) { closure in
+                completion {
+                    try closure()
+                    return (.buffer(drain.data), drain.data)
+                }
+            }
+            
+        default:
+            completion {
+                throw BodyError.inconvertibleType
+            }
+        }
+    }
+    
+    /**
+     Converts the body's contents into a `AsyncReceivingStream`
+     that can be received in chunks.
+     */
+    public func becomeAsyncReceiver(completion: @escaping ((Void) throws -> (Body, AsyncReceivingStream)) -> Void) {
+        switch self {
+        case .asyncReceiver(let stream):
+            completion {
+                (self, stream)
+            }
+        case .buffer(let data):
+            let stream = AsyncDrain(for: data)
+            completion {
+                (.asyncReceiver(stream), stream)
+            }
+        case .asyncSender(let sender):
+            let stream = AsyncDrain()
+            sender(stream) { closure in
+                completion {
+                    try closure()
+                    return (.asyncReceiver(stream), stream)
+                }
+            }
+        default:
+            completion {
+                throw BodyError.inconvertibleType
+            }
+        }
+    }
+    
+    /**
+     Converts the body's contents into a closure
+     that accepts a `AsyncSendingStream`.
+     */
+    public func becomeAsyncSender(timingOut deadline: Double = .never, completion: @escaping ((Void) throws -> (Body, ((AsyncSendingStream, @escaping ((Void) throws -> Void) -> Void) -> Void))) -> Void) {
+        
+        switch self {
+        case .buffer(let data):
+            let closure: ((AsyncSendingStream, @escaping ((Void) throws -> Void) -> Void) -> Void) = { sender, result in
+                sender.send(data, timingOut: deadline) { closure in
+                    result {
+                        try closure()
+                    }
+                }
+            }
+            completion {
+                return (.asyncSender(closure), closure)
+            }
+        case .asyncReceiver(let receiver):
+            let closure: ((AsyncSendingStream, @escaping ((Void) throws -> Void) -> Void) -> Void) = { sender, result in
+                _ = AsyncDrain(for: receiver, timingOut: deadline) { getData in
+                    do {
+                        let drain = try getData()
+                        sender.send(drain.data, timingOut: deadline, completion: result)
+                    } catch {
+                        result {
+                            throw error
+                        }
+                    }
+                }
+            }
+            completion {
+                return (.asyncSender(closure), closure)
+            }
+        case .asyncSender(let closure):
+            completion {
+                (self, closure)
+            }
+        default:
+            completion {
+                throw BodyError.inconvertibleType
+            }
+        }
     }
 }
